@@ -31,7 +31,7 @@
 #include <sys/select.h>
 #include <unistd.h>
 
-#define VERSION "1.2.0"
+#define VERSION "1.3.0"
 
 #define PI 3.14159265358979323846
 
@@ -314,6 +314,7 @@ typedef struct {
     int sel; /* 0 = none/hover away, 1 = first button, 2 = second */
     int refocus;      /* restore focus to the triggering window */
     Window prev_active; /* window that was active before we mapped */
+    char *tmux_pane;    /* $TMUX_PANE of the invoking pane (owned) */
     double btn_x, btn_y, btn_w, btn_h;
     double btn2_x, btn2_y, btn2_w, btn2_h;
 
@@ -662,6 +663,38 @@ static void restore_previous_focus(app_t *a)
     XFlush(a->dpy);
 }
 
+/* A tmux pane id looks like "%12". */
+static int valid_pane_id(const char *s)
+{
+    if (!s || s[0] != '%' || !s[1])
+        return 0;
+    for (const char *p = s + 1; *p; p++)
+        if (!isdigit((unsigned char)*p))
+            return 0;
+    return 1;
+}
+
+/*
+ * If we were started from a tmux pane, re-select that pane and its window
+ * after the notification, so typing continues where the command came from.
+ */
+static void focus_tmux_pane(const app_t *a)
+{
+    if (!a->refocus || !a->tmux_pane)
+        return;
+
+    pid_t pid = fork();
+    if (pid != 0)
+        return; /* parent (or fork failed): nothing to wait for */
+
+    execlp("tmux", "tmux",
+           "select-window", "-t", a->tmux_pane,
+           ";",
+           "select-pane", "-t", a->tmux_pane,
+           (char *)NULL);
+    _exit(127); /* no tmux client on PATH */
+}
+
 /* ---------------------------------------------------------------- window */
 
 static void set_atoms(app_t *a)
@@ -720,8 +753,8 @@ static void usage(FILE *out)
             "options:\n"
             "  -c, --confirm           ask a yes/no question: green Yes exits 0,\n"
             "                          No (or Esc / n) exits 1\n"
-            "  -r, --refocus           give keyboard focus back to the window\n"
-            "                          that was active before the notification\n"
+            "  -r, --refocus           give keyboard focus back to the window and\n"
+            "                          tmux pane that triggered the notification\n"
             "  -o, --opacity FLOAT     background opacity 0.0-1.0 "
             "(default 0.85)\n"
             "  -f, --font-size PX      message font size in pixels "
@@ -895,6 +928,13 @@ int main(int argc, char **argv)
         a.no_label = xstrdup("No");
     a.sel = a.confirm ? 1 : 0; /* Yes is preselected in yes/no mode */
 
+    /* remember our tmux pane (only relevant together with --refocus) */
+    if (a.refocus) {
+        const char *pane = getenv("TMUX_PANE");
+        if (valid_pane_id(pane))
+            a.tmux_pane = xstrdup(pane);
+    }
+
     if (first_msg < argc) {
         if (!strcmp(argv[first_msg], "-")) {
             a.text = read_stdin();
@@ -927,6 +967,7 @@ int main(int argc, char **argv)
         free(a.text);
         free(a.ok_label);
         free(a.no_label);
+        free(a.tmux_pane);
         printf("wrote %s (%dx%d)\n", preview_path, a.w, a.h);
         return 0;
     }
@@ -949,6 +990,7 @@ int main(int argc, char **argv)
         free(a.text);
         free(a.ok_label);
         free(a.no_label);
+        free(a.tmux_pane);
         XCloseDisplay(a.dpy);
         printf("wrote %s (%dx%d)\n", preview_path, a.w, a.h);
         return 0;
@@ -1096,6 +1138,7 @@ int main(int argc, char **argv)
 
     XUngrabKeyboard(a.dpy, CurrentTime);
     restore_previous_focus(&a);
+    focus_tmux_pane(&a);
     XDestroyWindow(a.dpy, a.win);
     XFreeCursor(a.dpy, a.c_blank);
     XFreeCursor(a.dpy, a.c_hand);
@@ -1103,6 +1146,7 @@ int main(int argc, char **argv)
     free(a.text);
     free(a.ok_label);
     free(a.no_label);
+    free(a.tmux_pane);
     XCloseDisplay(a.dpy);
     return g_stop ? 130 : a.result;
 }

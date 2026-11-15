@@ -26,9 +26,8 @@ struct backend {
     Visual *visual;
     int argb; /* window has an alpha channel => real transparency */
     Colormap cmap;
-    Cursor c_blank;
     Cursor c_hand;
-    Cursor c_current;
+    Cursor c_current; /* None means: inherit the root cursor */
     Window prev_active; /* window that was active before we mapped */
 };
 
@@ -38,17 +37,6 @@ static int on_x_error(Display *dpy, XErrorEvent *ev)
     (void)dpy;
     (void)ev;
     return 0;
-}
-
-static Cursor make_blank_cursor(Display *dpy)
-{
-    static const char bits[1] = {0};
-    Pixmap pm = XCreateBitmapFromData(dpy, DefaultRootWindow(dpy), bits, 1, 1);
-    XColor dummy;
-    memset(&dummy, 0, sizeof dummy);
-    Cursor c = XCreatePixmapCursor(dpy, pm, pm, &dummy, &dummy, 0, 0);
-    XFreePixmap(dpy, pm);
-    return c;
 }
 
 /* Ask the window manager to activate `target` (EWMH _NET_ACTIVE_WINDOW). */
@@ -243,10 +231,9 @@ void nf_bm_create_window(struct backend *be, nf_app *a)
                             &at);
     set_atoms(be);
 
-    be->c_blank = make_blank_cursor(be->dpy);
     be->c_hand = XCreateFontCursor(be->dpy, XC_hand2);
-    be->c_current = be->c_blank;
-    XDefineCursor(be->dpy, be->win, be->c_blank);
+    /* no cursor override: keep the desktop's normal pointer visible */
+    be->c_current = None;
 
     /* remember who had the focus, so --refocus can give it back later */
     be->prev_active = active_window_before(be->dpy, be->root);
@@ -275,7 +262,7 @@ void nf_bm_end_frame(struct backend *be, cairo_t *cr)
 
 void nf_bm_set_cursor(struct backend *be, int hand)
 {
-    Cursor c = hand ? be->c_hand : be->c_blank;
+    Cursor c = hand ? be->c_hand : None;
     if (be->c_current == c)
         return;
     be->c_current = c;
@@ -367,7 +354,6 @@ void nf_bm_destroy(struct backend *be)
 {
     XUngrabKeyboard(be->dpy, CurrentTime);
     XDestroyWindow(be->dpy, be->win);
-    XFreeCursor(be->dpy, be->c_blank);
     XFreeCursor(be->dpy, be->c_hand);
     nf_bm_close(be);
 }

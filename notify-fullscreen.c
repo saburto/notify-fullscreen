@@ -31,7 +31,7 @@
 #include <sys/select.h>
 #include <unistd.h>
 
-#define VERSION "1.0.0"
+#define VERSION "1.1.0"
 
 #define PI 3.14159265358979323846
 
@@ -48,13 +48,19 @@
 #define COL_OK_HOVER_R 0.239
 #define COL_OK_HOVER_G 0.843
 #define COL_OK_HOVER_B 0.451
+#define COL_NO_R 0.169
+#define COL_NO_G 0.196
+#define COL_NO_B 0.231
+#define COL_NO_HOVER_R 0.239
+#define COL_NO_HOVER_G 0.275
+#define COL_NO_HOVER_B 0.325
 
 /* ------------------------------------------------------------------ utils */
 
 static void die(const char *msg)
 {
     fprintf(stderr, "notify-fullscreen: %s\n", msg);
-    exit(1);
+    exit(3); /* runtime error; 1 is reserved for "answered No" */
 }
 
 static void *xmalloc(size_t n)
@@ -285,8 +291,9 @@ static void wrap_text(lines_t *out, cairo_t *cr, const char *text, double maxw)
 /* --------------------------------------------------------------- the app */
 
 typedef struct {
-    char *text;    /* raw message (owned) */
-    char *ok_label; /* button label (owned) */
+    char *text;     /* raw message (owned) */
+    char *ok_label; /* primary button label (owned) */
+    char *no_label; /* secondary button label (owned) */
 
     Display *dpy;
     Window root;
@@ -302,8 +309,13 @@ typedef struct {
 
     lines_t msg;
 
+    /* buttons: [0] = Yes/OK, [1] = No (--confirm only) */
+    int confirm;
+    int sel; /* 0 = none/hover away, 1 = first button, 2 = second */
     double btn_x, btn_y, btn_w, btn_h;
-    int hover;
+    double btn2_x, btn2_y, btn2_w, btn2_h;
+
+    int result; /* exit status: 0 = yes / acknowledged, 1 = no */
 
     Cursor c_blank, c_hand, c_current;
 
@@ -366,6 +378,18 @@ static int fit_message(app_t *a, cairo_t *cr, int fs, double maxw, double max_h)
     return fs;
 }
 
+static void draw_label(cairo_t *cr, const char *label, int font_px, double bx,
+                       double by, double bw, double bh)
+{
+    cairo_set_font_size(cr, font_px);
+    cairo_text_extents_t te;
+    cairo_text_extents(cr, label, &te);
+    cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+    cairo_move_to(cr, bx + (bw - te.x_advance) / 2.0 - te.x_bearing,
+                  by + bh / 2.0 - te.y_bearing - te.height / 2.0);
+    cairo_show_text(cr, label);
+}
+
 static void layout_and_paint(app_t *a, cairo_t *cr)
 {
     const int W = a->w, H = a->h;
@@ -388,21 +412,39 @@ static void layout_and_paint(app_t *a, cairo_t *cr)
         fs = clampi((int)(fs * 0.8), 14, 160);
     fs = fit_message(a, cr, fs, W * 0.80, H * 0.62);
 
-    /* the button is sized from the message font; shrink both until it fits */
+    /* the buttons are sized from the message font; shrink both until it fits */
     int bf = 0;
-    double label_w = 0, btn_h = 0, btn_w = 0, gap = 0, lh = 0, msg_h = 0,
-           total = 0;
+    double yes_w = 0, no_w = 0, row_w = 0, bgap = 0, btn_h = 0, gap = 0,
+           lh = 0, msg_h = 0, total = 0;
     for (int iter = 0;; iter++) {
         bf = clampi((int)(fs * 0.45), 14, 72);
         cairo_set_font_size(cr, bf);
-        label_w = measure(cr, a->ok_label);
 
         btn_h = bf * 2.4;
-        btn_w = label_w + btn_h * 1.9;
-        if (btn_w < btn_h * 2.8)
-            btn_w = btn_h * 2.8;
-        if (btn_w > W * 0.55)
-            btn_w = W * 0.55;
+        const double pad = btn_h * 1.9;
+        const double min_w = btn_h * 2.8;
+
+        yes_w = measure(cr, a->ok_label) + pad;
+        if (yes_w < min_w)
+            yes_w = min_w;
+
+        if (a->confirm) {
+            no_w = measure(cr, a->no_label) + pad;
+            if (no_w < min_w)
+                no_w = min_w;
+            if (no_w > yes_w)
+                yes_w = no_w;
+            no_w = yes_w;
+            bgap = btn_h * 0.35;
+            const double avail = W * 0.82 - bgap;
+            if (yes_w > avail / 2)
+                yes_w = no_w = avail / 2;
+            row_w = yes_w * 2 + bgap;
+        } else {
+            if (yes_w > W * 0.55)
+                yes_w = W * 0.55;
+            row_w = yes_w;
+        }
 
         gap = btn_h * 0.85;
         lh = fs * 1.34;
@@ -433,27 +475,52 @@ static void layout_and_paint(app_t *a, cairo_t *cr)
         y += lh;
     }
 
-    /* green button */
-    a->btn_w = btn_w;
-    a->btn_h = btn_h;
-    a->btn_x = (W - btn_w) / 2.0;
-    a->btn_y = top + msg_h + gap;
+    /* buttons */
+    const double radius = btn_h * 0.26;
+    const double row_x = (W - row_w) / 2.0;
+    const double by = top + msg_h + gap;
 
-    if (a->hover)
+    a->btn_x = row_x;
+    a->btn_y = by;
+    a->btn_w = yes_w;
+    a->btn_h = btn_h;
+    a->btn2_x = row_x + yes_w + bgap;
+    a->btn2_y = by;
+    a->btn2_w = no_w;
+    a->btn2_h = btn_h;
+
+    /* primary button: green (Yes / OK) */
+    if (a->sel == 1)
         cairo_set_source_rgb(cr, COL_OK_HOVER_R, COL_OK_HOVER_G,
                              COL_OK_HOVER_B);
     else
         cairo_set_source_rgb(cr, COL_OK_R, COL_OK_G, COL_OK_B);
-    rounded_rect(cr, a->btn_x, a->btn_y, btn_w, btn_h, btn_h * 0.26);
+    rounded_rect(cr, a->btn_x, by, yes_w, btn_h, radius);
     cairo_fill(cr);
+    draw_label(cr, a->ok_label, bf, a->btn_x, by, yes_w, btn_h);
 
-    cairo_set_font_size(cr, bf);
-    cairo_text_extents_t te;
-    cairo_text_extents(cr, a->ok_label, &te);
-    cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
-    cairo_move_to(cr, a->btn_x + (btn_w - te.x_advance) / 2.0 - te.x_bearing,
-                  a->btn_y + btn_h / 2.0 - te.y_bearing - te.height / 2.0);
-    cairo_show_text(cr, a->ok_label);
+    if (a->confirm) {
+        /* secondary button: neutral */
+        if (a->sel == 2)
+            cairo_set_source_rgb(cr, COL_NO_HOVER_R, COL_NO_HOVER_G,
+                                 COL_NO_HOVER_B);
+        else
+            cairo_set_source_rgb(cr, COL_NO_R, COL_NO_G, COL_NO_B);
+        rounded_rect(cr, a->btn2_x, by, no_w, btn_h, radius);
+        cairo_fill_preserve(cr);
+        cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.16);
+        cairo_set_line_width(cr, 1.5);
+        cairo_stroke(cr);
+        draw_label(cr, a->no_label, bf, a->btn2_x, by, no_w, btn_h);
+
+        /* focus ring around the selected button */
+        const double rx = a->sel == 2 ? a->btn2_x : a->btn_x;
+        const double rw = a->sel == 2 ? no_w : yes_w;
+        cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.55);
+        cairo_set_line_width(cr, 2.0);
+        rounded_rect(cr, rx - 4, by - 4, rw + 8, btn_h + 8, radius + 4);
+        cairo_stroke(cr);
+    }
 }
 
 static void repaint(app_t *a)
@@ -468,10 +535,21 @@ static void repaint(app_t *a)
     XFlush(a->dpy);
 }
 
-static int point_in_button(const app_t *a, int x, int y)
+static int inside(double x, double y, double bx, double by, double bw,
+                  double bh)
 {
-    return x >= a->btn_x && x <= a->btn_x + a->btn_w && y >= a->btn_y &&
-           y <= a->btn_y + a->btn_h;
+    return x >= bx && x <= bx + bw && y >= by && y <= by + bh;
+}
+
+/* 0 = no button, 1 = primary (Yes/OK), 2 = secondary (No) */
+static int hit_button(const app_t *a, int x, int y)
+{
+    if (inside(x, y, a->btn_x, a->btn_y, a->btn_w, a->btn_h))
+        return 1;
+    if (a->confirm &&
+        inside(x, y, a->btn2_x, a->btn2_y, a->btn2_w, a->btn2_h))
+        return 2;
+    return 0;
 }
 
 static void set_cursor(app_t *a, Cursor c)
@@ -582,16 +660,24 @@ static void usage(FILE *out)
             "acknowledged with the green OK button, Enter, Space or Esc.\n"
             "\n"
             "options:\n"
+            "  -c, --confirm           ask a yes/no question: green Yes exits 0,\n"
+            "                          No (or Esc / n) exits 1\n"
             "  -o, --opacity FLOAT     background opacity 0.0-1.0 "
             "(default 0.85)\n"
             "  -f, --font-size PX      message font size in pixels "
             "(default: screen based)\n"
-            "      --ok-label TEXT     button label (default \"OK\")\n"
+            "      --ok-label TEXT     primary button label "
+            "(default \"OK\", \"Yes\" with -c)\n"
+            "      --no-label TEXT     secondary button label "
+            "(default \"No\", only with -c)\n"
             "  -h, --help              show this help and exit\n"
             "  -V, --version           print version and exit\n"
             "\n"
             "MESSAGE may span several arguments (joined with spaces);\n"
-            "use \"-\" to read the message from standard input.\n");
+            "use \"-\" to read the message from standard input.\n"
+            "\n"
+            "exit status: 0 = OK/Yes, 1 = No, 2 = usage error,\n"
+            "             3 = runtime error, 130 = interrupted\n");
 }
 
 static char *read_stdin(void)
@@ -686,6 +772,19 @@ int main(int argc, char **argv)
             a.font_px = (int)v;
             continue;
         }
+        if (!strcmp(arg, "-c") || !strcmp(arg, "--confirm")) {
+            a.confirm = 1;
+            continue;
+        }
+        if (!strcmp(arg, "--no-label")) {
+            if (++i >= argc) {
+                fprintf(stderr, "notify-fullscreen: --no-label needs a value\n");
+                return 2;
+            }
+            free(a.no_label);
+            a.no_label = xstrdup(argv[i]);
+            continue;
+        }
         if (!strcmp(arg, "--ok-label")) {
             if (++i >= argc) {
                 fprintf(stderr, "notify-fullscreen: --ok-label needs a value\n");
@@ -727,13 +826,18 @@ int main(int argc, char **argv)
     }
 
     if (!a.ok_label)
-        a.ok_label = xstrdup("OK");
+        a.ok_label = xstrdup(a.confirm ? "Yes" : "OK");
+    if (!a.no_label)
+        a.no_label = xstrdup("No");
+    a.sel = a.confirm ? 1 : 0; /* Yes is preselected in yes/no mode */
 
     if (first_msg < argc) {
         if (!strcmp(argv[first_msg], "-")) {
             a.text = read_stdin();
-            if (!a.text)
-                die("no message on standard input");
+            if (!a.text) {
+                fprintf(stderr, "notify-fullscreen: empty message on stdin\n");
+                return 2;
+            }
         } else {
             a.text = join_args(argc, argv, first_msg);
         }
@@ -758,6 +862,7 @@ int main(int argc, char **argv)
         lines_free(&a.msg);
         free(a.text);
         free(a.ok_label);
+        free(a.no_label);
         printf("wrote %s (%dx%d)\n", preview_path, a.w, a.h);
         return 0;
     }
@@ -777,6 +882,9 @@ int main(int argc, char **argv)
         a.argb = 1; /* keep the alpha channel so the PNG shows the dimming */
         write_preview(&a, preview_path);
         lines_free(&a.msg);
+        free(a.text);
+        free(a.ok_label);
+        free(a.no_label);
         XCloseDisplay(a.dpy);
         printf("wrote %s (%dx%d)\n", preview_path, a.w, a.h);
         return 0;
@@ -850,31 +958,61 @@ int main(int argc, char **argv)
                 XGrabKeyboard(a.dpy, a.win, True, GrabModeAsync,
                               GrabModeAsync, CurrentTime);
                 break;
-            case MotionNotify:
-                if (point_in_button(&a, ev.xmotion.x, ev.xmotion.y)) {
-                    set_cursor(&a, a.c_hand);
-                    if (!a.hover) {
-                        a.hover = 1;
-                        repaint(&a);
-                    }
-                } else {
-                    set_cursor(&a, a.c_blank);
-                    if (a.hover) {
-                        a.hover = 0;
-                        repaint(&a);
-                    }
+            case MotionNotify: {
+                const int hit = hit_button(&a, ev.xmotion.x, ev.xmotion.y);
+                int newsel = hit;
+                if (a.confirm && hit == 0)
+                    newsel = a.sel ? a.sel : 1; /* keep keyboard selection */
+                set_cursor(&a, hit ? a.c_hand : a.c_blank);
+                if (newsel != a.sel) {
+                    a.sel = newsel;
+                    repaint(&a);
                 }
                 break;
-            case ButtonPress:
-                if (ev.xbutton.button == Button1 &&
-                    point_in_button(&a, ev.xbutton.x, ev.xbutton.y))
+            }
+            case ButtonPress: {
+                if (ev.xbutton.button != Button1)
+                    break;
+                const int hit = hit_button(&a, ev.xbutton.x, ev.xbutton.y);
+                if (hit == 1) {
+                    a.result = 0;
                     a.done = 1;
+                } else if (hit == 2) {
+                    a.result = 1;
+                    a.done = 1;
+                }
                 break;
+            }
             case KeyPress: {
                 KeySym ks = XLookupKeysym(&ev.xkey, 0);
-                if (ks == XK_Return || ks == XK_KP_Enter || ks == XK_space ||
-                    ks == XK_Escape || ks == XK_q || ks == XK_y)
+                if (!a.confirm) {
+                    if (ks == XK_Return || ks == XK_KP_Enter ||
+                        ks == XK_space || ks == XK_Escape || ks == XK_q ||
+                        ks == XK_y) {
+                        a.result = 0;
+                        a.done = 1;
+                    }
+                    break;
+                }
+                if (ks == XK_Return || ks == XK_KP_Enter || ks == XK_space) {
+                    a.result = a.sel == 2 ? 1 : 0;
                     a.done = 1;
+                } else if (ks == XK_y || ks == XK_Y) {
+                    a.result = 0;
+                    a.done = 1;
+                } else if (ks == XK_n || ks == XK_N || ks == XK_Escape) {
+                    a.result = 1;
+                    a.done = 1;
+                } else if (ks == XK_Tab) {
+                    a.sel = a.sel == 2 ? 1 : 2;
+                    repaint(&a);
+                } else if (ks == XK_Left && a.sel != 1) {
+                    a.sel = 1;
+                    repaint(&a);
+                } else if (ks == XK_Right && a.sel != 2) {
+                    a.sel = 2;
+                    repaint(&a);
+                }
                 break;
             }
             default:
@@ -896,6 +1034,7 @@ int main(int argc, char **argv)
     lines_free(&a.msg);
     free(a.text);
     free(a.ok_label);
+    free(a.no_label);
     XCloseDisplay(a.dpy);
-    return g_stop ? 130 : 0;
+    return g_stop ? 130 : a.result;
 }

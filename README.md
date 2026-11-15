@@ -1,7 +1,9 @@
 # notify-fullscreen
 
 A tiny fullscreen notifier for Linux: it dims the screen, shows a message and
-waits until you acknowledge it with a green **OK** button.
+waits until you acknowledge it with a green **OK** button — or, with
+`--confirm`, until you answer **Yes** or **No** (the exit status tells you
+which).
 
 It is meant for the things you *must* see — a finished long build, a failed
 cron/backup job, a deploy that went wrong — without a notification daemon and
@@ -25,6 +27,17 @@ so the desktop behind it stays visible.</sub>
   Xwayland), on Hyprland, sway, i3, XFCE and friends.
 * Message is **wrapped and auto-sized**: short messages get a big font, long
   ones shrink to fit.
+* Optional **Yes/No question mode**: `yes` exits `0`, `no` exits `1`, so it
+  drops straight into `if notify-fullscreen --confirm …; then`.
+
+```sh
+$ notify-fullscreen --confirm "Deploy api-gateway v2.4.1 to production?"
+```
+
+![confirm preview](docs/confirm.png)
+
+<sub>Yes/No mode: `Y`/`Enter` picks the selected (green) button, `N`/`Esc` answers
+No, `Tab`/`←`/`→` move the selection, the mouse hovers either one.</sub>
 
 ## Build & install
 
@@ -45,14 +58,20 @@ Only two shared libraries are required at runtime: `libX11` and `libcairo`
 ```
 usage: notify-fullscreen [options] MESSAGE
 
+  -c, --confirm           ask a yes/no question: green Yes exits 0,
+                          No (or Esc / n) exits 1
   -o, --opacity FLOAT     background opacity 0.0-1.0 (default 0.85)
   -f, --font-size PX      message font size in pixels (default: screen based)
-      --ok-label TEXT     button label (default "OK")
+      --ok-label TEXT     primary button label (default "OK", "Yes" with -c)
+      --no-label TEXT     secondary button label (default "No", only with -c)
   -h, --help              show this help and exit
   -V, --version           print version and exit
 
 MESSAGE may span several arguments (joined with spaces);
 use "-" to read the message from standard input.
+
+exit status: 0 = OK/Yes, 1 = No, 2 = usage error,
+             3 = runtime error, 130 = interrupted
 ```
 
 Examples:
@@ -70,13 +89,39 @@ notify-fullscreen --opacity 0.6 --ok-label "Got it" "Disk /var is 92% full"
 
 # long text: wrapped automatically
 notify-fullscreen "Backup job failed after 3 retries: destination unreachable, last error: connection reset by peer while uploading archive segment 7 of 42"
+
+# yes/no question, custom labels
+notify-fullscreen --confirm --no-label "Skip" "Run the migrations?"
 ```
 
-Dismiss it with the green **OK** button, `Enter`, `Space` or `Esc`
-(`q`/`y` also work). The mouse cursor stays hidden until it hovers the button.
+Acknowledge the notifier with the green **OK** button, `Enter`, `Space` or
+`Esc` (`q`/`y` also work). The mouse cursor stays hidden until it hovers a
+button.
 
-Exit status: `0` acknowledged · `2` usage error · `1` no X display
-· `130` interrupted (SIGINT/SIGTERM/SIGHUP — the window is cleaned up).
+Exit status: `0` OK / Yes · `1` No (`--confirm` only) · `2` usage error
+· `3` runtime error (e.g. no X display) · `130` interrupted
+(SIGINT/SIGTERM/SIGHUP — the window is cleaned up).
+
+### Yes/No questions
+
+`--confirm` turns the notification into a question with two buttons — green
+**Yes** and neutral **No** — and reports the answer through the exit status:
+
+| answer                | exit |
+| --------------------- | ---- |
+| green **Yes**, `y`    | `0`  |
+| **No**, `n`, `Esc`    | `1`  |
+
+`Yes` is selected by default; `Tab` or `←`/`→` move the selection and
+`Enter`/`Space` activates the selected button. The mouse can hover either one.
+
+```sh
+if notify-fullscreen --confirm "Deploy to production?"; then
+    ./deploy.sh
+else
+    echo "deploy cancelled" >&2
+fi
+```
 
 ## How it is used from scripts
 
@@ -100,12 +145,12 @@ notify-fullscreen "...deploy failed..." &
   a layer-shell protocol (not exposed to normal apps) to cover the screen
   reliably; through Xwayland the same thing is one window plus two EWMH hints,
   and it stays dependency-free. If your session has no Xwayland (`$DISPLAY`
-  unset) the tool tells you so and exits `1`.
+  unset) the tool tells you so and exits `3`.
 * Without a compositing manager there is no real transparency; the overlay then
   falls back to an opaque dark background, everything else works the same.
 * Keyboard focus: the overlay asks the window manager to activate it. Some
   setups with strict focus-stealing prevention may keep focus elsewhere — the
-  OK button always works with the mouse.
+  buttons always work with the mouse.
 * `--preview-png FILE [--preview-size WxH]` renders the overlay to a PNG
   instead of showing it; handy for screenshots/docs, and it works headless when
   `--preview-size` is given.

@@ -1,0 +1,901 @@
+/*
+ * notify-fullscreen — a tiny fullscreen modal notifier for Linux (X11 / Xwayland)
+ *
+ * Shows a message on top of everything in a dimmed fullscreen overlay and
+ * waits until the user acknowledges it with the green OK button, Enter,
+ * Space or Esc.
+ *
+ * Build:  make
+ * Usage:  notify-fullscreen "message"
+ *
+ * Dependencies: libX11, cairo (Xft/FreeType come with cairo).
+ * License: MIT
+ */
+
+#define _POSIX_C_SOURCE 200809L
+
+#include <X11/Xatom.h>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/cursorfont.h>
+#include <X11/keysym.h>
+
+#include <cairo/cairo.h>
+#include <cairo/cairo-xlib.h>
+
+#include <ctype.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/select.h>
+#include <unistd.h>
+
+#define VERSION "1.0.0"
+
+#define PI 3.14159265358979323846
+
+/* palette */
+#define COL_BG_R 0.016
+#define COL_BG_G 0.020
+#define COL_BG_B 0.027
+#define COL_TEXT_R 0.965
+#define COL_TEXT_G 0.973
+#define COL_TEXT_B 0.984
+#define COL_OK_R 0.153
+#define COL_OK_G 0.729
+#define COL_OK_B 0.341
+#define COL_OK_HOVER_R 0.239
+#define COL_OK_HOVER_G 0.843
+#define COL_OK_HOVER_B 0.451
+
+/* ------------------------------------------------------------------ utils */
+
+static void die(const char *msg)
+{
+    fprintf(stderr, "notify-fullscreen: %s\n", msg);
+    exit(1);
+}
+
+static void *xmalloc(size_t n)
+{
+    void *p = malloc(n ? n : 1);
+    if (!p)
+        die("out of memory");
+    return p;
+}
+
+static void *xrealloc(void *p, size_t n)
+{
+    void *q = realloc(p, n ? n : 1);
+    if (!q)
+        die("out of memory");
+    return q;
+}
+
+static char *xstrdup(const char *s)
+{
+    size_t n = strlen(s) + 1;
+    char *c = xmalloc(n);
+    memcpy(c, s, n);
+    return c;
+}
+
+static int clampi(int v, int lo, int hi)
+{
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/* set from a signal handler, polled by the event loop */
+static volatile sig_atomic_t g_stop;
+
+static void on_signal(int sig)
+{
+    (void)sig;
+    g_stop = 1;
+}
+
+static size_t utf8_len(unsigned char c)
+{
+    if (c < 0x80)
+        return 1;
+    if ((c & 0xE0) == 0xC0)
+        return 2;
+    if ((c & 0xF0) == 0xE0)
+        return 3;
+    if ((c & 0xF8) == 0xF0)
+        return 4;
+    return 1; /* invalid byte: advance one */
+}
+
+static void rounded_rect(cairo_t *cr, double x, double y, double w, double h,
+                         double r)
+{
+    if (r > w / 2)
+        r = w / 2;
+    if (r > h / 2)
+        r = h / 2;
+    cairo_new_sub_path(cr);
+    cairo_arc(cr, x + w - r, y + r, r, -PI / 2, 0);
+    cairo_arc(cr, x + w - r, y + h - r, r, 0, PI / 2);
+    cairo_arc(cr, x + r, y + h - r, r, PI / 2, PI);
+    cairo_arc(cr, x + r, y + r, r, PI, 3 * PI / 2);
+    cairo_close_path(cr);
+}
+
+/* -------------------------------------------------------- dynamic strings */
+
+typedef struct {
+    char *s;
+    size_t n, cap;
+} sbuf;
+
+static void sb_append(sbuf *b, const char *s, size_t len)
+{
+    if (b->n + len + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap : 64;
+        while (cap < b->n + len + 1)
+            cap *= 2;
+        b->s = xrealloc(b->s, cap);
+        b->cap = cap;
+    }
+    memcpy(b->s + b->n, s, len);
+    b->n += len;
+    b->s[b->n] = '\0';
+}
+
+static void sb_clear(sbuf *b)
+{
+    b->n = 0;
+    if (b->s)
+        b->s[0] = '\0';
+}
+
+static void sb_free(sbuf *b)
+{
+    free(b->s);
+    b->s = NULL;
+    b->n = b->cap = 0;
+}
+
+/* ------------------------------------------------------------ line blocks */
+
+typedef struct {
+    char **v;
+    size_t n, cap;
+} lines_t;
+
+static void lines_free(lines_t *l)
+{
+    for (size_t i = 0; i < l->n; i++)
+        free(l->v[i]);
+    free(l->v);
+    l->v = NULL;
+    l->n = l->cap = 0;
+}
+
+static void lines_push(lines_t *l, const char *s, size_t len)
+{
+    if (l->n == l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 16;
+        l->v = xrealloc(l->v, l->cap * sizeof *l->v);
+    }
+    char *copy = xmalloc(len + 1);
+    memcpy(copy, s, len);
+    copy[len] = '\0';
+    l->v[l->n++] = copy;
+}
+
+static double measure(cairo_t *cr, const char *s)
+{
+    cairo_text_extents_t te;
+    cairo_text_extents(cr, s, &te);
+    return te.x_advance;
+}
+
+/* Break one over-long token into chunks that fit into `maxw`. */
+static void hard_break(lines_t *out, cairo_t *cr, sbuf *line, double maxw)
+{
+    while (line->n && measure(cr, line->s) > maxw) {
+        size_t fit = 0;
+        for (size_t k = 0; k < line->n;) {
+            size_t step = utf8_len((unsigned char)line->s[k]);
+            if (k + step > line->n)
+                step = 1;
+            char saved = line->s[k + step];
+            line->s[k + step] = '\0';
+            double w = measure(cr, line->s);
+            line->s[k + step] = saved;
+            if (w > maxw)
+                break;
+            fit = k + step;
+            k += step;
+        }
+        if (fit == 0)
+            fit = 1; /* never loop forever on a zero-width char */
+        lines_push(out, line->s, fit);
+        memmove(line->s, line->s + fit, line->n - fit);
+        line->n -= fit;
+        line->s[line->n] = '\0';
+        while (line->n && line->s[0] == ' ') {
+            memmove(line->s, line->s + 1, line->n - 1);
+            line->n--;
+            line->s[line->n] = '\0';
+        }
+    }
+}
+
+static void wrap_paragraph(lines_t *out, cairo_t *cr, const char *p, size_t len,
+                           double maxw)
+{
+    sbuf line = {0};
+    sbuf cand = {0};
+    size_t i = 0;
+    int had_word = 0;
+
+    while (i < len) {
+        while (i < len && isspace((unsigned char)p[i]))
+            i++;
+        if (i >= len)
+            break;
+        size_t start = i;
+        while (i < len && !isspace((unsigned char)p[i]))
+            i++;
+        size_t wlen = i - start;
+        had_word = 1;
+
+        sb_clear(&cand);
+        if (line.n) {
+            sb_append(&cand, line.s, line.n);
+            sb_append(&cand, " ", 1);
+        }
+        sb_append(&cand, p + start, wlen);
+
+        if (line.n && measure(cr, cand.s) > maxw) {
+            lines_push(out, line.s, line.n);
+            sb_clear(&line);
+            sb_append(&line, p + start, wlen);
+        } else {
+            sb_clear(&line);
+            sb_append(&line, cand.s, cand.n);
+        }
+        hard_break(out, cr, &line, maxw);
+    }
+
+    if (line.n || !had_word)
+        lines_push(out, line.n ? line.s : "", line.n);
+
+    sb_free(&line);
+    sb_free(&cand);
+}
+
+static void wrap_text(lines_t *out, cairo_t *cr, const char *text, double maxw)
+{
+    const char *p = text;
+    for (;;) {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        wrap_paragraph(out, cr, p, len, maxw);
+        if (!nl)
+            break;
+        p = nl + 1;
+    }
+}
+
+/* --------------------------------------------------------------- the app */
+
+typedef struct {
+    char *text;    /* raw message (owned) */
+    char *ok_label; /* button label (owned) */
+
+    Display *dpy;
+    Window root;
+    Window win;
+    Visual *visual;
+    int argb; /* window has an alpha channel => real transparency */
+    Colormap cmap;
+
+    int w, h;
+
+    double opacity; /* 0..1 background alpha */
+    int font_px;    /* 0 = automatic */
+
+    lines_t msg;
+
+    double btn_x, btn_y, btn_w, btn_h;
+    int hover;
+
+    Cursor c_blank, c_hand, c_current;
+
+    int done;
+} app_t;
+
+static int wrap_at(app_t *a, cairo_t *cr, int fs, double maxw)
+{
+    cairo_set_font_size(cr, fs);
+    lines_free(&a->msg);
+    wrap_text(&a->msg, cr, a->text, maxw);
+    return fs;
+}
+
+/*
+ * Wrap the message and pick a font size: short messages get a bigger font,
+ * very long ones are shrunk until they fit above the button.
+ * Leaves the message wrapped and `cr`'s font size set to the result.
+ */
+static int fit_message(app_t *a, cairo_t *cr, int fs, double maxw, double max_h)
+{
+    const int explicit_size = a->font_px > 0;
+    const int cap = clampi((int)(a->h * 0.09), fs, 240);
+    const double lh_ratio = 1.34;
+
+    if (max_h < 40)
+        max_h = a->h * 0.3;
+
+    wrap_at(a, cr, fs, maxw);
+
+    if (!explicit_size && strlen(a->text) <= 140) {
+        for (int i = 0; i < 4; i++) {
+            double widest = 0;
+            for (size_t k = 0; k < a->msg.n; k++) {
+                double w = measure(cr, a->msg.v[k]);
+                if (w > widest)
+                    widest = w;
+            }
+            if (widest <= 0)
+                break;
+            const double want = a->w * 0.55;
+            if (widest >= want * 0.92)
+                break;
+            int next = (int)(fs * (want / widest));
+            if (next > cap)
+                next = cap;
+            if (next <= fs)
+                break;
+            fs = next;
+            wrap_at(a, cr, fs, maxw);
+        }
+    }
+
+    while (fs > 9 && a->msg.n * (fs * lh_ratio) > max_h) {
+        fs = (int)(fs * 0.9);
+        wrap_at(a, cr, fs, maxw);
+    }
+
+    cairo_set_font_size(cr, fs);
+    return fs;
+}
+
+static void layout_and_paint(app_t *a, cairo_t *cr)
+{
+    const int W = a->w, H = a->h;
+
+    /* dimmed (or opaque, without a compositor) background */
+    cairo_save(cr);
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_rgba(cr, COL_BG_R, COL_BG_G, COL_BG_B,
+                          a->argb ? a->opacity : 1.0);
+    cairo_paint(cr);
+    cairo_restore(cr);
+
+    /* message */
+    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL,
+                           CAIRO_FONT_WEIGHT_BOLD);
+
+    int fs = a->font_px > 0 ? a->font_px
+                            : clampi((int)(H * 0.052), 16, 160);
+    if (a->font_px <= 0 && W < 900)
+        fs = clampi((int)(fs * 0.8), 14, 160);
+    fs = fit_message(a, cr, fs, W * 0.80, H * 0.62);
+
+    /* the button is sized from the message font; shrink both until it fits */
+    int bf = 0;
+    double label_w = 0, btn_h = 0, btn_w = 0, gap = 0, lh = 0, msg_h = 0,
+           total = 0;
+    for (int iter = 0;; iter++) {
+        bf = clampi((int)(fs * 0.45), 14, 72);
+        cairo_set_font_size(cr, bf);
+        label_w = measure(cr, a->ok_label);
+
+        btn_h = bf * 2.4;
+        btn_w = label_w + btn_h * 1.9;
+        if (btn_w < btn_h * 2.8)
+            btn_w = btn_h * 2.8;
+        if (btn_w > W * 0.55)
+            btn_w = W * 0.55;
+
+        gap = btn_h * 0.85;
+        lh = fs * 1.34;
+        msg_h = a->msg.n * lh;
+        total = msg_h + gap + btn_h;
+
+        if (total <= H * 0.90 || iter > 12 || fs <= 9)
+            break;
+
+        fs = (int)(fs * 0.93);
+        wrap_at(a, cr, fs, W * 0.80);
+    }
+
+    double top = (H - total) / 2.0;
+    if (top < H * 0.05)
+        top = H * 0.05;
+
+    /* message lines, centered one by one */
+    cairo_set_font_size(cr, fs);
+    cairo_set_source_rgb(cr, COL_TEXT_R, COL_TEXT_G, COL_TEXT_B);
+    double y = top;
+    for (size_t i = 0; i < a->msg.n; i++) {
+        cairo_text_extents_t te;
+        cairo_text_extents(cr, a->msg.v[i], &te);
+        cairo_move_to(cr, (W - te.x_advance) / 2.0 - te.x_bearing,
+                      y + lh / 2.0 - te.y_bearing - te.height / 2.0);
+        cairo_show_text(cr, a->msg.v[i]);
+        y += lh;
+    }
+
+    /* green button */
+    a->btn_w = btn_w;
+    a->btn_h = btn_h;
+    a->btn_x = (W - btn_w) / 2.0;
+    a->btn_y = top + msg_h + gap;
+
+    if (a->hover)
+        cairo_set_source_rgb(cr, COL_OK_HOVER_R, COL_OK_HOVER_G,
+                             COL_OK_HOVER_B);
+    else
+        cairo_set_source_rgb(cr, COL_OK_R, COL_OK_G, COL_OK_B);
+    rounded_rect(cr, a->btn_x, a->btn_y, btn_w, btn_h, btn_h * 0.26);
+    cairo_fill(cr);
+
+    cairo_set_font_size(cr, bf);
+    cairo_text_extents_t te;
+    cairo_text_extents(cr, a->ok_label, &te);
+    cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+    cairo_move_to(cr, a->btn_x + (btn_w - te.x_advance) / 2.0 - te.x_bearing,
+                  a->btn_y + btn_h / 2.0 - te.y_bearing - te.height / 2.0);
+    cairo_show_text(cr, a->ok_label);
+}
+
+static void repaint(app_t *a)
+{
+    cairo_surface_t *sf =
+        cairo_xlib_surface_create(a->dpy, a->win, a->visual, a->w, a->h);
+    cairo_t *cr = cairo_create(sf);
+    layout_and_paint(a, cr);
+    cairo_surface_flush(sf);
+    cairo_destroy(cr);
+    cairo_surface_destroy(sf);
+    XFlush(a->dpy);
+}
+
+static int point_in_button(const app_t *a, int x, int y)
+{
+    return x >= a->btn_x && x <= a->btn_x + a->btn_w && y >= a->btn_y &&
+           y <= a->btn_y + a->btn_h;
+}
+
+static void set_cursor(app_t *a, Cursor c)
+{
+    if (a->c_current == c)
+        return;
+    a->c_current = c;
+    XDefineCursor(a->dpy, a->win, c);
+}
+
+static Cursor make_blank_cursor(Display *dpy)
+{
+    static const char bits[1] = {0};
+    Pixmap pm = XCreateBitmapFromData(dpy, DefaultRootWindow(dpy), bits, 1, 1);
+    XColor dummy;
+    memset(&dummy, 0, sizeof dummy);
+    Cursor c = XCreatePixmapCursor(dpy, pm, pm, &dummy, &dummy, 0, 0);
+    XFreePixmap(dpy, pm);
+    return c;
+}
+
+/* X errors are not fatal here: focus/grab races happen under Xwayland. */
+static int on_x_error(Display *dpy, XErrorEvent *ev)
+{
+    (void)dpy;
+    (void)ev;
+    return 0;
+}
+
+/* Ask the window manager to give us the keyboard focus. */
+static void request_focus(app_t *a)
+{
+    XEvent ev;
+    memset(&ev, 0, sizeof ev);
+    ev.xclient.type = ClientMessage;
+    ev.xclient.window = a->win;
+    ev.xclient.message_type = XInternAtom(a->dpy, "_NET_ACTIVE_WINDOW", False);
+    ev.xclient.format = 32;
+    ev.xclient.data.l[0] = 2; /* source: pager — allowed to steal focus */
+    ev.xclient.data.l[1] = CurrentTime;
+    ev.xclient.data.l[2] = 0;
+    XSendEvent(a->dpy, a->root, False,
+               SubstructureRedirectMask | SubstructureNotifyMask, &ev);
+
+    XWindowAttributes wa;
+    if (!XGetWindowAttributes(a->dpy, a->win, &wa) ||
+        wa.map_state != IsViewable)
+        return; /* XSetInputFocus/XGrabKeyboard would raise BadMatch */
+
+    XSetInputFocus(a->dpy, a->win, RevertToPointerRoot, CurrentTime);
+    XGrabKeyboard(a->dpy, a->win, True, GrabModeAsync, GrabModeAsync,
+                  CurrentTime);
+}
+
+/* ---------------------------------------------------------------- window */
+
+static void set_atoms(app_t *a)
+{
+    Atom state = XInternAtom(a->dpy, "_NET_WM_STATE", False);
+    Atom vals[3] = {
+        XInternAtom(a->dpy, "_NET_WM_STATE_FULLSCREEN", False),
+        XInternAtom(a->dpy, "_NET_WM_STATE_ABOVE", False),
+        XInternAtom(a->dpy, "_NET_WM_STATE_SKIP_TASKBAR", False),
+    };
+    XChangeProperty(a->dpy, a->win, state, XA_ATOM, 32, PropModeReplace,
+                    (unsigned char *)vals, 3);
+
+    Atom type = XInternAtom(a->dpy, "_NET_WM_WINDOW_TYPE", False);
+    Atom normal = XInternAtom(a->dpy, "_NET_WM_WINDOW_TYPE_NORMAL", False);
+    XChangeProperty(a->dpy, a->win, type, XA_ATOM, 32, PropModeReplace,
+                    (unsigned char *)&normal, 1);
+
+    /* keep the notification out of the WM's minimise/close UI */
+    Atom pid = XInternAtom(a->dpy, "_NET_WM_PID", False);
+    long pidval = (long)getpid();
+    XChangeProperty(a->dpy, a->win, pid, XA_CARDINAL, 32, PropModeReplace,
+                    (unsigned char *)&pidval, 1);
+
+    XStoreName(a->dpy, a->win, "notify-fullscreen");
+    XClassHint hint = {(char *)"notify-fullscreen",
+                       (char *)"Notify-fullscreen"};
+    XSetClassHint(a->dpy, a->win, &hint);
+}
+
+/* --------------------------------------------------------- preview (png) */
+
+static void write_preview(app_t *a, const char *path)
+{
+    cairo_surface_t *sf =
+        cairo_image_surface_create(CAIRO_FORMAT_ARGB32, a->w, a->h);
+    cairo_t *cr = cairo_create(sf);
+    layout_and_paint(a, cr);
+    cairo_destroy(cr);
+    cairo_status_t st = cairo_surface_write_to_png(sf, path);
+    cairo_surface_destroy(sf);
+    if (st != CAIRO_STATUS_SUCCESS)
+        die(cairo_status_to_string(st));
+}
+
+/* ------------------------------------------------------------------ main */
+
+static void usage(FILE *out)
+{
+    fprintf(out,
+            "usage: notify-fullscreen [options] MESSAGE\n"
+            "\n"
+            "Show MESSAGE in a fullscreen, dimmed overlay until it is\n"
+            "acknowledged with the green OK button, Enter, Space or Esc.\n"
+            "\n"
+            "options:\n"
+            "  -o, --opacity FLOAT     background opacity 0.0-1.0 "
+            "(default 0.85)\n"
+            "  -f, --font-size PX      message font size in pixels "
+            "(default: screen based)\n"
+            "      --ok-label TEXT     button label (default \"OK\")\n"
+            "  -h, --help              show this help and exit\n"
+            "  -V, --version           print version and exit\n"
+            "\n"
+            "MESSAGE may span several arguments (joined with spaces);\n"
+            "use \"-\" to read the message from standard input.\n");
+}
+
+static char *read_stdin(void)
+{
+    size_t cap = 4096, n = 0;
+    char *buf = xmalloc(cap);
+
+    for (;;) {
+        if (n + 1 >= cap)
+            buf = xrealloc(buf, cap *= 2);
+        size_t got = fread(buf + n, 1, cap - n - 1, stdin);
+        if (got == 0)
+            break;
+        n += got;
+    }
+    buf[n] = '\0';
+
+    /* drop trailing newlines, like pipelines from `echo` produce */
+    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
+        buf[--n] = '\0';
+
+    if (n == 0) {
+        free(buf);
+        return NULL;
+    }
+    return buf;
+}
+
+static char *join_args(int argc, char **argv, int first)
+{
+    size_t len = 0;
+    for (int i = first; i < argc; i++)
+        len += strlen(argv[i]) + 1;
+    char *buf = xmalloc(len + 1);
+    buf[0] = '\0';
+    for (int i = first; i < argc; i++) {
+        if (i > first)
+            strcat(buf, " ");
+        strcat(buf, argv[i]);
+    }
+    return buf;
+}
+
+int main(int argc, char **argv)
+{
+    app_t a;
+    memset(&a, 0, sizeof a);
+    a.opacity = 0.85;
+    a.font_px = 0;
+
+    const char *preview_path = NULL;
+    int preview_w = 0, preview_h = 0;
+    int first_msg = argc;
+
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i];
+        if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
+            usage(stdout);
+            return 0;
+        }
+        if (!strcmp(arg, "-V") || !strcmp(arg, "--version")) {
+            printf("notify-fullscreen %s\n", VERSION);
+            return 0;
+        }
+        if (!strcmp(arg, "-o") || !strcmp(arg, "--opacity")) {
+            if (++i >= argc) {
+                fprintf(stderr, "notify-fullscreen: --opacity needs a value\n");
+                return 2;
+            }
+            char *end = NULL;
+            double v = strtod(argv[i], &end);
+            if (!end || *end || !(v >= 0.0 && v <= 1.0)) {
+                fprintf(stderr, "notify-fullscreen: opacity must be 0.0-1.0\n");
+                return 2;
+            }
+            a.opacity = v;
+            continue;
+        }
+        if (!strcmp(arg, "-f") || !strcmp(arg, "--font-size")) {
+            if (++i >= argc) {
+                fprintf(stderr,
+                        "notify-fullscreen: --font-size needs a value\n");
+                return 2;
+            }
+            char *end = NULL;
+            long v = strtol(argv[i], &end, 10);
+            if (!end || *end || v < 6 || v > 400) {
+                fprintf(stderr,
+                        "notify-fullscreen: font size must be 6-400 px\n");
+                return 2;
+            }
+            a.font_px = (int)v;
+            continue;
+        }
+        if (!strcmp(arg, "--ok-label")) {
+            if (++i >= argc) {
+                fprintf(stderr, "notify-fullscreen: --ok-label needs a value\n");
+                return 2;
+            }
+            free(a.ok_label);
+            a.ok_label = xstrdup(argv[i]);
+            continue;
+        }
+        if (!strcmp(arg, "--preview-png")) {
+            if (++i >= argc) {
+                fprintf(stderr,
+                        "notify-fullscreen: --preview-png needs a path\n");
+                return 2;
+            }
+            preview_path = argv[i];
+            continue;
+        }
+        if (!strcmp(arg, "--preview-size")) {
+            if (++i >= argc ||
+                sscanf(argv[i], "%dx%d", &preview_w, &preview_h) != 2 ||
+                preview_w < 200 || preview_h < 200) {
+                fprintf(stderr,
+                        "notify-fullscreen: --preview-size needs WxH\n");
+                return 2;
+            }
+            continue;
+        }
+        if (!strcmp(arg, "--")) {
+            first_msg = i + 1;
+            break;
+        }
+        if (arg[0] == '-' && arg[1] != '\0' && strcmp(arg, "-")) {
+            fprintf(stderr, "notify-fullscreen: unknown option %s\n", arg);
+            return 2;
+        }
+        first_msg = i;
+        break;
+    }
+
+    if (!a.ok_label)
+        a.ok_label = xstrdup("OK");
+
+    if (first_msg < argc) {
+        if (!strcmp(argv[first_msg], "-")) {
+            a.text = read_stdin();
+            if (!a.text)
+                die("no message on standard input");
+        } else {
+            a.text = join_args(argc, argv, first_msg);
+        }
+    } else if (!isatty(STDIN_FILENO)) {
+        a.text = read_stdin();
+        if (!a.text) {
+            usage(stderr);
+            return 2;
+        }
+    } else {
+        usage(stderr);
+        return 2;
+    }
+
+    /* ---- display ---- */
+    if (preview_path && preview_w > 0 && preview_h > 0) {
+        /* headless preview: no DISPLAY needed, fonts come from fontconfig */
+        a.argb = 1;
+        a.w = preview_w;
+        a.h = preview_h;
+        write_preview(&a, preview_path);
+        lines_free(&a.msg);
+        free(a.text);
+        free(a.ok_label);
+        printf("wrote %s (%dx%d)\n", preview_path, a.w, a.h);
+        return 0;
+    }
+
+    a.dpy = XOpenDisplay(NULL);
+    if (!a.dpy) {
+        die("cannot open X display (is DISPLAY set? "
+            "is Xwayland/X11 running?)");
+    }
+    a.root = DefaultRootWindow(a.dpy);
+    XSetErrorHandler(on_x_error);
+    int screen = DefaultScreen(a.dpy);
+    a.w = preview_w > 0 ? preview_w : DisplayWidth(a.dpy, screen);
+    a.h = preview_h > 0 ? preview_h : DisplayHeight(a.dpy, screen);
+
+    if (preview_path) {
+        a.argb = 1; /* keep the alpha channel so the PNG shows the dimming */
+        write_preview(&a, preview_path);
+        lines_free(&a.msg);
+        XCloseDisplay(a.dpy);
+        printf("wrote %s (%dx%d)\n", preview_path, a.w, a.h);
+        return 0;
+    }
+
+    /* pick a 32-bit ARGB visual so the background can be translucent */
+    XVisualInfo vinfo;
+    if (XMatchVisualInfo(a.dpy, screen, 32, TrueColor, &vinfo)) {
+        a.visual = vinfo.visual;
+        a.argb = 1;
+    } else {
+        a.visual = DefaultVisual(a.dpy, screen);
+        a.argb = 0;
+    }
+
+    XSetWindowAttributes at;
+    memset(&at, 0, sizeof at);
+    at.border_pixel = 0;
+    at.background_pixel = 0;
+    at.background_pixmap = None;
+    at.event_mask = ExposureMask | KeyPressMask | ButtonPressMask |
+                    PointerMotionMask | StructureNotifyMask | FocusChangeMask;
+    if (a.argb) {
+        a.cmap = XCreateColormap(a.dpy, a.root, a.visual, AllocNone);
+        at.colormap = a.cmap;
+    }
+    a.win = XCreateWindow(a.dpy, a.root, 0, 0, (unsigned)a.w, (unsigned)a.h, 0,
+                          a.argb ? 32 : DefaultDepth(a.dpy, screen),
+                          InputOutput, a.visual,
+                          CWColormap | CWBorderPixel | CWBackPixel |
+                              CWBackPixmap | CWEventMask,
+                          &at);
+    set_atoms(&a);
+
+    a.c_blank = make_blank_cursor(a.dpy);
+    a.c_hand = XCreateFontCursor(a.dpy, XC_hand2);
+    a.c_current = a.c_blank;
+    XDefineCursor(a.dpy, a.win, a.c_blank);
+
+    XMapRaised(a.dpy, a.win);
+
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+    signal(SIGHUP, on_signal);
+
+    int xfd = ConnectionNumber(a.dpy);
+    fd_set fds;
+
+    while (!a.done) {
+        while (XPending(a.dpy)) {
+            XEvent ev;
+            XNextEvent(a.dpy, &ev);
+            switch (ev.type) {
+            case Expose:
+                if (ev.xexpose.count == 0)
+                    repaint(&a);
+                break;
+            case ConfigureNotify:
+                if (ev.xconfigure.width != a.w ||
+                    ev.xconfigure.height != a.h) {
+                    a.w = ev.xconfigure.width;
+                    a.h = ev.xconfigure.height;
+                    repaint(&a);
+                }
+                break;
+            case MapNotify:
+                request_focus(&a);
+                repaint(&a);
+                break;
+            case FocusIn:
+                XGrabKeyboard(a.dpy, a.win, True, GrabModeAsync,
+                              GrabModeAsync, CurrentTime);
+                break;
+            case MotionNotify:
+                if (point_in_button(&a, ev.xmotion.x, ev.xmotion.y)) {
+                    set_cursor(&a, a.c_hand);
+                    if (!a.hover) {
+                        a.hover = 1;
+                        repaint(&a);
+                    }
+                } else {
+                    set_cursor(&a, a.c_blank);
+                    if (a.hover) {
+                        a.hover = 0;
+                        repaint(&a);
+                    }
+                }
+                break;
+            case ButtonPress:
+                if (ev.xbutton.button == Button1 &&
+                    point_in_button(&a, ev.xbutton.x, ev.xbutton.y))
+                    a.done = 1;
+                break;
+            case KeyPress: {
+                KeySym ks = XLookupKeysym(&ev.xkey, 0);
+                if (ks == XK_Return || ks == XK_KP_Enter || ks == XK_space ||
+                    ks == XK_Escape || ks == XK_q || ks == XK_y)
+                    a.done = 1;
+                break;
+            }
+            default:
+                break;
+            }
+        }
+        if (a.done || g_stop)
+            break;
+        FD_ZERO(&fds);
+        FD_SET(xfd, &fds);
+        struct timeval tv = {0, 200000};
+        select(xfd + 1, &fds, NULL, NULL, &tv);
+    }
+
+    XUngrabKeyboard(a.dpy, CurrentTime);
+    XDestroyWindow(a.dpy, a.win);
+    XFreeCursor(a.dpy, a.c_blank);
+    XFreeCursor(a.dpy, a.c_hand);
+    lines_free(&a.msg);
+    free(a.text);
+    free(a.ok_label);
+    XCloseDisplay(a.dpy);
+    return g_stop ? 130 : 0;
+}

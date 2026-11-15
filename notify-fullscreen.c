@@ -31,7 +31,7 @@
 #include <sys/select.h>
 #include <unistd.h>
 
-#define VERSION "1.1.0"
+#define VERSION "1.2.0"
 
 #define PI 3.14159265358979323846
 
@@ -312,6 +312,8 @@ typedef struct {
     /* buttons: [0] = Yes/OK, [1] = No (--confirm only) */
     int confirm;
     int sel; /* 0 = none/hover away, 1 = first button, 2 = second */
+    int refocus;      /* restore focus to the triggering window */
+    Window prev_active; /* window that was active before we mapped */
     double btn_x, btn_y, btn_w, btn_h;
     double btn2_x, btn2_y, btn2_w, btn2_h;
 
@@ -579,20 +581,55 @@ static int on_x_error(Display *dpy, XErrorEvent *ev)
     return 0;
 }
 
-/* Ask the window manager to give us the keyboard focus. */
-static void request_focus(app_t *a)
+/* Ask the window manager to activate `target` (EWMH _NET_ACTIVE_WINDOW). */
+static void ask_wm_to_activate(Display *dpy, Window root, Window target)
 {
     XEvent ev;
     memset(&ev, 0, sizeof ev);
     ev.xclient.type = ClientMessage;
-    ev.xclient.window = a->win;
-    ev.xclient.message_type = XInternAtom(a->dpy, "_NET_ACTIVE_WINDOW", False);
+    ev.xclient.window = target;
+    ev.xclient.message_type = XInternAtom(dpy, "_NET_ACTIVE_WINDOW", False);
     ev.xclient.format = 32;
     ev.xclient.data.l[0] = 2; /* source: pager — allowed to steal focus */
     ev.xclient.data.l[1] = CurrentTime;
-    ev.xclient.data.l[2] = 0;
-    XSendEvent(a->dpy, a->root, False,
+    ev.xclient.data.l[2] = None;
+    XSendEvent(dpy, root, False,
                SubstructureRedirectMask | SubstructureNotifyMask, &ev);
+}
+
+/* The window that had the focus before we appeared (--refocus). */
+static Window active_window_before(Display *dpy, Window root)
+{
+    Atom act = XInternAtom(dpy, "_NET_ACTIVE_WINDOW", False);
+    Atom type = None;
+    int fmt = 0;
+    unsigned long n = 0, after = 0;
+    unsigned char *data = NULL;
+    Window w = None;
+
+    if (XGetWindowProperty(dpy, root, act, 0, 1, False, XA_WINDOW, &type,
+                           &fmt, &n, &after, &data) == Success &&
+        data) {
+        if (fmt == 32 && n == 1)
+            w = (Window)((long *)data)[0];
+        XFree(data);
+    }
+
+    if (!w) {
+        /* no EWMH-ish state, try the plain X input focus */
+        int revert = 0;
+        Window f = None;
+        XGetInputFocus(dpy, &f, &revert);
+        if (f != None && f != PointerRoot && f != root)
+            w = f;
+    }
+    return w;
+}
+
+/* Ask the window manager to give us the keyboard focus. */
+static void request_focus(app_t *a)
+{
+    ask_wm_to_activate(a->dpy, a->root, a->win);
 
     XWindowAttributes wa;
     if (!XGetWindowAttributes(a->dpy, a->win, &wa) ||
@@ -602,6 +639,27 @@ static void request_focus(app_t *a)
     XSetInputFocus(a->dpy, a->win, RevertToPointerRoot, CurrentTime);
     XGrabKeyboard(a->dpy, a->win, True, GrabModeAsync, GrabModeAsync,
                   CurrentTime);
+}
+
+/* Give the keyboard focus back to the window that triggered us (--refocus). */
+static void restore_previous_focus(app_t *a)
+{
+    if (!a->refocus || !a->prev_active || a->prev_active == a->win)
+        return;
+
+    /* hide first, so the WM has a chance to re-focus on its own as well */
+    XUnmapWindow(a->dpy, a->win);
+    XFlush(a->dpy);
+
+    ask_wm_to_activate(a->dpy, a->root, a->prev_active);
+
+    XWindowAttributes wa;
+    if (XGetWindowAttributes(a->dpy, a->prev_active, &wa) &&
+        wa.map_state == IsViewable)
+        XSetInputFocus(a->dpy, a->prev_active, RevertToPointerRoot,
+                       CurrentTime);
+
+    XFlush(a->dpy);
 }
 
 /* ---------------------------------------------------------------- window */
@@ -662,6 +720,8 @@ static void usage(FILE *out)
             "options:\n"
             "  -c, --confirm           ask a yes/no question: green Yes exits 0,\n"
             "                          No (or Esc / n) exits 1\n"
+            "  -r, --refocus           give keyboard focus back to the window\n"
+            "                          that was active before the notification\n"
             "  -o, --opacity FLOAT     background opacity 0.0-1.0 "
             "(default 0.85)\n"
             "  -f, --font-size PX      message font size in pixels "
@@ -774,6 +834,10 @@ int main(int argc, char **argv)
         }
         if (!strcmp(arg, "-c") || !strcmp(arg, "--confirm")) {
             a.confirm = 1;
+            continue;
+        }
+        if (!strcmp(arg, "-r") || !strcmp(arg, "--refocus")) {
+            a.refocus = 1;
             continue;
         }
         if (!strcmp(arg, "--no-label")) {
@@ -924,6 +988,9 @@ int main(int argc, char **argv)
     a.c_current = a.c_blank;
     XDefineCursor(a.dpy, a.win, a.c_blank);
 
+    /* remember who had the focus, so --refocus can give it back later */
+    a.prev_active = active_window_before(a.dpy, a.root);
+
     XMapRaised(a.dpy, a.win);
 
     signal(SIGINT, on_signal);
@@ -1028,6 +1095,7 @@ int main(int argc, char **argv)
     }
 
     XUngrabKeyboard(a.dpy, CurrentTime);
+    restore_previous_focus(&a);
     XDestroyWindow(a.dpy, a.win);
     XFreeCursor(a.dpy, a.c_blank);
     XFreeCursor(a.dpy, a.c_hand);

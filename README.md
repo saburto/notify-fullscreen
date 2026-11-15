@@ -29,6 +29,8 @@ so the desktop behind it stays visible.</sub>
   ones shrink to fit.
 * Optional **Yes/No question mode**: `yes` exits `0`, `no` exits `1`, so it
   drops straight into `if notify-fullscreen --confirm …; then`.
+* Optional **focus restore**: `--refocus` gives the keyboard back to the window
+  that was active before the notification appeared.
 
 ```sh
 $ notify-fullscreen --confirm "Deploy api-gateway v2.4.1 to production?"
@@ -60,6 +62,8 @@ usage: notify-fullscreen [options] MESSAGE
 
   -c, --confirm           ask a yes/no question: green Yes exits 0,
                           No (or Esc / n) exits 1
+  -r, --refocus           give keyboard focus back to the window
+                          that was active before the notification
   -o, --opacity FLOAT     background opacity 0.0-1.0 (default 0.85)
   -f, --font-size PX      message font size in pixels (default: screen based)
       --ok-label TEXT     primary button label (default "OK", "Yes" with -c)
@@ -128,9 +132,25 @@ fi
 ```sh
 #!/bin/sh
 if ! ./deploy.sh; then
-    notify-fullscreen "Deploy failed on $(hostname) at $(date +%H:%M)"
+    notify-fullscreen --refocus "Deploy failed on $(hostname) at $(date +%H:%M)"
 fi
 ```
+
+Opening the notification takes the keyboard away from whatever you were doing;
+the window manager usually returns focus when it closes, but not all of them do
+(i3 etc.). With `--refocus` the notifier itself remembers the active window and
+activates it again after you dismiss the overlay, so you can carry on typing in
+the app that triggered it.
+
+```sh
+notify-fullscreen --refocus "Build finished"
+```
+
+Focus restore targets X11/Xwayland windows — that includes the window of a
+Wayland app as seen through Xwayland only indirectly. If the trigger is
+Wayland-native, there is no X11 window to activate; the compositor's own
+focus handling applies (GNOME/KDE do restore it), and the flag simply does
+nothing extra.
 
 Since it blocks until acknowledged, run it in the background if the script
 must continue:
@@ -151,6 +171,10 @@ notify-fullscreen "...deploy failed..." &
 * Keyboard focus: the overlay asks the window manager to activate it. Some
   setups with strict focus-stealing prevention may keep focus elsewhere — the
   buttons always work with the mouse.
+* `--refocus` saves `_NET_ACTIVE_WINDOW` before mapping and re-activates that
+  window (via `_NET_ACTIVE_WINDOW` plus `XSetInputFocus`) on exit. Verified on a
+  bare X server without a window manager, where focus would otherwise be lost
+  to `PointerRoot`.
 * `--preview-png FILE [--preview-size WxH]` renders the overlay to a PNG
   instead of showing it; handy for screenshots/docs, and it works headless when
   `--preview-size` is given.

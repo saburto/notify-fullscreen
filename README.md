@@ -56,6 +56,26 @@ make install                                # -> ~/.local/bin/notify-fullscreen
 Only two shared libraries are required at runtime: `libX11` and `libcairo`
 (cairo pulls in FreeType/fontconfig for text).
 
+A CMake build is also provided (`cmake -S . -B build && cmake --build build`).
+
+### Source layout
+
+The UI core is platform independent; a backend owns the window, event loop and
+cairo surface, so ports only implement `src/backend.h`.
+
+```
+src/nf.h            core types, key actions, app state, core API
+src/platform.h      per-platform constants (font family, version)
+src/text.c          UTF-8 helpers, measuring, word wrapping
+src/layout.c        layout + palette, paints into any cairo context
+src/app.c           hit testing, input handling, repaint bridge, main loop
+src/preview.c       --preview-png (works headless)
+src/tmux.c          tmux pane restore (POSIX; no-op on Windows)
+src/main.c          CLI parsing, message/stdin, exit codes
+src/backend/x11.c   X11 / Xwayland backend
+src/backend.h       backend interface (Windows/macOS slot in here)
+```
+
 ## Usage
 
 ```

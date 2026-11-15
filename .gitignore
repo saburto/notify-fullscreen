@@ -1,3 +1,4 @@
 /notify-fullscreen
 /preview.png
 *.o
+/build/
